@@ -21,6 +21,9 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb/input.h>
+#include <linux/interrupt.h>
+#include <linux/hrtimer.h>
+#include <linux/sched.h>
 
 #include "hid-ids.h"
 
@@ -28,7 +31,7 @@ static bool emulate_3button = true;
 module_param(emulate_3button, bool, 0644);
 MODULE_PARM_DESC(emulate_3button, "Emulate a middle button");
 
-static bool middle_click_3finger = false;
+static bool middle_click_3finger = true;
 module_param(middle_click_3finger, bool, 0644);
 MODULE_PARM_DESC(middle_click_3finger, "Use 3 finger click to emulate middle button");
 
@@ -39,7 +42,7 @@ static bool emulate_scroll_wheel = true;
 module_param(emulate_scroll_wheel, bool, 0644);
 MODULE_PARM_DESC(emulate_scroll_wheel, "Emulate a scroll wheel");
 
-static unsigned int scroll_speed = 32;
+static unsigned int scroll_speed = 50;
 static int param_set_scroll_speed(const char *val,
 				  const struct kernel_param *kp) {
 	unsigned long speed;
@@ -51,7 +54,7 @@ static int param_set_scroll_speed(const char *val,
 module_param_call(scroll_speed, param_set_scroll_speed, param_get_uint, &scroll_speed, 0644);
 MODULE_PARM_DESC(scroll_speed, "Scroll speed, value from 0 (slow) to 63 (fast)");
 
-static bool scroll_acceleration = false;
+static bool scroll_acceleration = true;
 module_param(scroll_acceleration, bool, 0644);
 MODULE_PARM_DESC(scroll_acceleration, "Accelerate sequential scroll events");
 
@@ -76,6 +79,8 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 #define TOUCH_STATE_NONE  0x00
 #define TOUCH_STATE_START 0x30
 #define TOUCH_STATE_DRAG  0x40
+#define TOUCH_STATE_END   0x70
+// order is start -> drag -> end
 
 #define SCROLL_ACCEL_DEFAULT 3
 
@@ -114,6 +119,8 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 #define MAX_TOUCHES		16
 
+#define TOUCH_HISTORY_SIZE 8
+
 /**
  * struct magicmouse_sc - Tracks Magic Mouse-specific data.
  * @input: Input device through which we report events.
@@ -141,6 +148,83 @@ struct magicmouse_sc {
 	} touches[MAX_TOUCHES];
 	int tracking_ids[MAX_TOUCHES];
 };
+
+// circular buffer
+short touch_history_size = 0;
+short touch_history_pointer = 0;
+struct point {
+	short x;
+	short y;
+} touch_history[TOUCH_HISTORY_SIZE];
+// every distance_threshold, we move scroll cursor by one step
+const short distance_threshold = 200;
+// increase to keep scroll velocity constant/more spacey feeling/better freewheel
+// decrease to stop scrolling sooner
+const short deceleration_divisor = 50;
+// distance travelled since finger release
+short mouse_distance_x = 0;
+short mouse_distance_y = 0;
+// current scroll velocity
+short mouse_velocity_x = 0;
+short mouse_velocity_y = 0;
+// true -> to positive axis, false to negative axis
+// distance/velocity/acceleration are absolute values
+bool mouse_scroll_dir_x = true;
+bool mouse_scroll_dir_y = true;
+static struct hrtimer htimer;
+// total scroll time after mouse touch end in milliseconds
+const int SCROLL_TIME_MS = 700;
+// periode between two scroll events in milliseconds
+const int SCROLL_PERIODE_MS = 16;
+// how often the timer is called before velocity reaches 0
+const int TIMER_CALL_COUNT = SCROLL_TIME_MS / SCROLL_PERIODE_MS;
+static ktime_t kt_periode;
+// input device to report input events from timer
+struct input_dev *input_global = NULL;
+
+
+static enum hrtimer_restart periodic_scroll(struct hrtimer *timer)
+{
+	short step_x = 1;
+	short step_y = 1;
+	bool changed = false;
+	if (mouse_velocity_x <= 0 && mouse_velocity_y <= 0) {
+		return HRTIMER_NORESTART;
+	}
+	hrtimer_forward_now(timer, kt_periode);
+	// update distance by velocity
+	mouse_distance_x += mouse_velocity_x;
+	mouse_distance_y += mouse_velocity_y;
+	// reduce velocity periodically
+	mouse_velocity_x -= max(1, mouse_velocity_x / 50);
+	mouse_velocity_y -= max(1, mouse_velocity_y / 50);
+	mouse_velocity_x = max((short)0, mouse_velocity_x);
+	mouse_velocity_y = max((short)0, mouse_velocity_y);
+	// scroll every distance_threshold steps
+	if (mouse_distance_x > distance_threshold) {
+		step_x = mouse_distance_x / distance_threshold;
+		mouse_distance_x -= step_x * distance_threshold;
+		if (!mouse_scroll_dir_x) {
+			step_x *= -1;
+		}
+		changed = true;
+		input_report_rel(input_global, REL_HWHEEL, step_x);
+	}
+	if (mouse_distance_y > distance_threshold) {
+		step_y = mouse_distance_y / distance_threshold;
+		mouse_distance_y -= step_y * distance_threshold;
+		if (!mouse_scroll_dir_y) {
+			step_y *= -1;
+		}
+		changed = true;
+		input_report_rel(input_global, REL_WHEEL, step_y);
+	}
+	if (changed) {
+		input_sync(input_global);
+	}
+	return HRTIMER_RESTART;
+}
+
 
 static int magicmouse_firm_touch(struct magicmouse_sc *msc)
 {
@@ -235,6 +319,8 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id,
 	struct input_dev *input = msc->input;
 	int id, x, y, size, orientation, touch_major, touch_minor, state, down;
 	int pressure = 0;
+	short i, min_x, max_x, min_y, max_y;
+	short min_xi, max_xi, min_yi, max_yi;
 
 	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
 		input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
@@ -321,7 +407,13 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id,
 						msc->scroll_accel - 1, 1);
 			else
 				msc->scroll_accel = SCROLL_ACCEL_DEFAULT;
-
+			touch_history_size = 0;
+			touch_history_pointer = 0;
+			mouse_distance_x = 0;
+			mouse_distance_y = 0;
+			mouse_velocity_x = 0;
+			mouse_velocity_y = 0;
+			hrtimer_cancel(&htimer);
 			break;
 		case TOUCH_STATE_DRAG:
 			step_x /= (64 - (int)scroll_speed) * msc->scroll_accel;
@@ -339,6 +431,45 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id,
 				msc->scroll_jiffies = now;
 				input_report_rel(input, REL_WHEEL, step_y);
 			}
+			touch_history[touch_history_pointer].x = x;
+			touch_history[touch_history_pointer].y = y;
+			touch_history_pointer = (touch_history_pointer + 1) % TOUCH_HISTORY_SIZE;
+			touch_history_size = min(touch_history_size + 1, TOUCH_HISTORY_SIZE);
+			break;
+		case TOUCH_STATE_END:
+			min_xi = -1;
+			max_xi = -1;
+			min_yi = -1;
+			max_yi = -1;
+			min_x = 10000;
+			max_x = -10000;
+			min_y = 10000;
+			max_y = -10000;
+			for (i = 0; i < touch_history_size; i++) {
+				int index = (touch_history_pointer + i) % TOUCH_HISTORY_SIZE;
+				if (touch_history[index].x < min_x) {
+					min_x = touch_history[index].x;
+					min_xi = i;
+				}
+				if (touch_history[index].x > max_x) {
+					max_x = touch_history[index].x;
+					max_xi = i;
+				}
+				if (touch_history[index].y < min_y) {
+					min_y = touch_history[index].y;
+					min_yi = i;
+				}
+				if (touch_history[index].y > max_y) {
+					max_y = touch_history[index].y;
+					max_yi = i;
+				}
+			}
+			mouse_velocity_x = max_x - min_x;
+			mouse_velocity_y = max_y - min_y;
+			mouse_scroll_dir_y = min_yi > touch_history_size / 2;
+			mouse_scroll_dir_x = min_xi < touch_history_size / 2;
+			input_global = msc->input;
+			hrtimer_start(&htimer, kt_periode, HRTIMER_MODE_REL);
 			break;
 		}
 	}
@@ -507,8 +638,10 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
 		input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		magicmouse_emit_buttons(msc, clicks & 3);
-		input_report_rel(input, REL_X, x);
-		input_report_rel(input, REL_Y, y);
+		// I uncommented this, because I don't know how to remove the default bluetooth mouse driver lol
+		// and ofc I don't want two mice driver for double speed 😅
+		//input_report_rel(input, REL_X, x);
+		//input_report_rel(input, REL_Y, y);
 	} else if (input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD) {
 		input_report_key(input, BTN_MOUSE, clicks & 1);
 		input_mt_report_pointer_emulation(input, true);
@@ -709,6 +842,13 @@ static int magicmouse_probe(struct hid_device *hdev,
 	int feature_size;
 	struct usb_interface *intf;
 
+	// timer to scroll after after finger released touchpad
+	// 1000*1000 is one millisecond
+	// parameters are in (seconds, nanoseconds)
+	kt_periode = ktime_set(0, SCROLL_PERIODE_MS * 1000 * 1000);
+	hrtimer_init(&htimer, CLOCK_REALTIME, HRTIMER_MODE_REL);
+	htimer.function = periodic_scroll;
+
 	if (id->vendor == USB_VENDOR_ID_APPLE &&
 	    id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
 		intf = to_usb_interface(hdev->dev.parent);
@@ -818,6 +958,11 @@ err_stop_hw:
 	return ret;
 }
 
+static void magicmouse_remove(struct hid_device *hdev)
+{
+	hrtimer_cancel(&htimer);
+}
+
 static const struct hid_device_id magic_mice[] = {
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_APPLE,
 		USB_DEVICE_ID_APPLE_MAGICMOUSE), .driver_data = 0 },
@@ -837,6 +982,7 @@ static struct hid_driver magicmouse_driver = {
 	.name = "magicmouse",
 	.id_table = magic_mice,
 	.probe = magicmouse_probe,
+	.remove = magicmouse_remove,
 	.raw_event = magicmouse_raw_event,
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,

@@ -10,3 +10,8 @@ all:
 
 clean:
 	$(MAKE) -C $(KERNEL_MODULES) M=$(PWD) clean
+
+install:
+	modprobe -r hid-magicmouse
+	insmod ./hid-magicmouse.ko
+
